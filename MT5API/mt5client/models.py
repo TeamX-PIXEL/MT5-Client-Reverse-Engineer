@@ -64,6 +64,8 @@ class Position:
     magic: int = 0
     comment: str = ""
     time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    time_open: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    current_price: float = 0.0
 
 
 @dataclass

@@ -1,6 +1,6 @@
 """
-Live Position Monitor — Uses cmd22 callbacks for real-time updates
-Place trades on MT5 terminal and watch them appear instantly.
+Live Position Monitor — cmd10 callbacks + cmd4 profit poll + cmd3 balance poll
+Place trades on MT5 terminal and watch them appear instantly with live profit.
 """
 import asyncio
 import sys
@@ -48,7 +48,7 @@ def on_account(acct):
 
 async def main():
     print("=" * 70)
-    print("LIVE POSITION MONITOR (cmd22 callbacks)")
+    print("LIVE POSITION MONITOR (cmd10 + cmd4 profit + cmd3 balance)")
     print(f"Account: {LOGIN} ({SERVER})")
     print("Place/close trades on MT5 terminal — updates appear instantly")
     print("Press Ctrl+C to stop")
@@ -56,11 +56,9 @@ async def main():
     print()
 
     async with MT5Client(login=LOGIN, password=PASSWORD, server=SERVER) as client:
-        # Register callbacks
         client.on_position(on_position)
         client.on_account(on_account)
 
-        # Initial load
         positions = await client.get_positions()
         print(f"[{time.strftime('%H:%M:%S')}] Initial: {len(positions)} positions")
         for p in positions:
@@ -70,12 +68,11 @@ async def main():
                   f"@ {p.price:.5f} profit={p.profit:.2f}")
 
         if client._account:
-            print(f"  Balance: {client._account.balance:.2f} Equity: {client._account.equity:.2f}")
+            print(f"  Balance: {client._account.balance:.2f}")
         print()
-        print(">>> Waiting for live updates... (place trades on MT5 terminal) <<<")
+        print(">>> Waiting for live updates... <<<")
         print()
 
-        # Keep alive — heartbeat runs automatically
         while True:
             await asyncio.sleep(1)
 

@@ -71,6 +71,7 @@ class MT5Client:
         self._position_cache: dict[int, Position] = {}  # ticket -> Position (from TRADE_EVENT)
         self._order_cache: dict[int, Order] = {}  # ticket -> Order (from pending trade results)
         self._debug_recv = False  # Set True to log all incoming commands
+        self._raw_cmd10_capture: list | None = None  # Set to [] to capture raw cmd10 bodies
 
     async def __aenter__(self):
         # 1. Resolve server IP
@@ -90,9 +91,10 @@ class MT5Client:
         # 4. Login (cmd 28)
         await self._login()
 
-        # 5. Start background receive loop + heartbeat
+        # 5. Start background receive loop + heartbeat + account poll
         self._recv_task = asyncio.create_task(self._recv_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._account_poll_task = asyncio.create_task(self._account_poll_loop())
 
         # 6. Load account + symbols
         acct_resp = await self.send_and_wait(3, b'', 3)
@@ -172,6 +174,8 @@ class MT5Client:
                 elif cmd == 17:
                     await self._handle_spec(msg)
                 elif cmd in (10, 22):
+                    if self._raw_cmd10_capture is not None:
+                        self._raw_cmd10_capture.append((cmd, msg['res_body']))
                     await self._handle_position_update(msg)
                 elif cmd == 14:
                     await self._handle_account_update(msg)
@@ -194,6 +198,83 @@ class MT5Client:
                 break
             except Exception:
                 break
+
+    async def _account_poll_loop(self):
+        """Poll cmd4 + cmd3 every 2 seconds for position list + balance.
+
+        cmd4 returns 344-byte records matching the uu schema:
+            @0:   ticket (i64)
+            @16:  time_create_sec (u32)
+            @88:  trade_action (u32)
+            @108: sl (f64)
+            @116: tp (f64)
+            @124: volume (u64)
+            @132: profit (f64) — server-provided, stale
+            @164: swap (f64)
+            @172: magic (i64)
+            @188: comment (UTF-16LE 64B)
+            @336: time_create_ms (i32)
+
+        Profit recalculated from live quotes each cycle (matching web terminal).
+        """
+        CMD4_RECORD_SIZE = 344
+        CMD4_HEADER = 4
+
+        while not self._cancelled.is_set():
+            try:
+                await asyncio.sleep(2)
+                # Poll cmd4 for position list
+                resp = await self.send_and_wait(4, b'', 4, timeout=5)
+                if resp:
+                    body = resp['res_body']
+                    if len(body) >= CMD4_HEADER + CMD4_RECORD_SIZE:
+                        count = struct.unpack_from('<I', body, 0)[0]
+                        for i in range(count):
+                            off = CMD4_HEADER + i * CMD4_RECORD_SIZE
+                            if off + CMD4_RECORD_SIZE > len(body):
+                                break
+                            ticket = struct.unpack_from('<Q', body, off)[0]
+                            pos = self._position_cache.get(ticket)
+                            if pos:
+                                pos.sl = struct.unpack_from('<d', body, off + 108)[0]
+                                pos.tp = struct.unpack_from('<d', body, off + 116)[0]
+                                pos.swap = struct.unpack_from('<d', body, off + 164)[0]
+                                cmd4_magic = struct.unpack_from('<q', body, off + 172)[0]
+                                if cmd4_magic != 0:
+                                    pos.magic = cmd4_magic
+                                raw_comment = body[off+188:off+252].decode('utf-16-le', errors='ignore').split('\x00')[0]
+                                if raw_comment:
+                                    m, c = parse_magic_comment(raw_comment)
+                                    if m != 0:
+                                        pos.magic = m
+                                    if c:
+                                        pos.comment = c
+                                tcs = struct.unpack_from('<I', body, off + 16)[0]
+                                tms = struct.unpack_from('<i', body, off + 336)[0]
+                                if tcs > 0:
+                                    pos.time_open = ts_to_dt(tcs)
+                # Calculate live profit + current price from quotes for ALL positions
+                for ticket, pos in self._position_cache.items():
+                    if pos.volume > 0 and pos.price > 0:
+                        quote = self._quotes.get(pos.symbol)
+                        if quote:
+                            if pos.type == 0:
+                                pos.current_price = quote.bid
+                                pos.profit = (quote.bid - pos.price) * pos.volume * 100000
+                            else:
+                                pos.current_price = quote.ask
+                                pos.profit = (pos.price - quote.ask) * pos.volume * 100000
+                # Poll cmd3 for account balance
+                acct = await self.get_account()
+                if acct and self._on_account_callback:
+                    try:
+                        self._on_account_callback(acct)
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
 
     async def send_and_wait(self, cmd_id: int, payload: bytes = b'',
                             expected_cmd: int = None, timeout: float = 10) -> dict | None:
@@ -670,10 +751,10 @@ class MT5Client:
         if len(body) >= ap_off + 32:
             event = {
                 'retcode': struct.unpack_from('<I', body, ap_off)[0],
-                'deal': struct.unpack_from('<q', body, ap_off + 4)[0],
-                'order': struct.unpack_from('<q', body, ap_off + 12)[0],
-                'position': struct.unpack_from('<q', body, ap_off + 12)[0],
-                'volume': struct.unpack_from('<q', body, ap_off + 20)[0],
+                'deal': struct.unpack_from('<Q', body, ap_off + 4)[0],
+                'order': struct.unpack_from('<Q', body, ap_off + 12)[0],
+                'position': struct.unpack_from('<Q', body, ap_off + 12)[0],
+                'volume': struct.unpack_from('<Q', body, ap_off + 20)[0],
                 'price': struct.unpack_from('<d', body, ap_off + 28)[0],
                 'comment': body[ap_off + 64:ap_off + 128].decode('utf-16-le', errors='ignore').rstrip('\x00'),
             }
@@ -704,7 +785,7 @@ class MT5Client:
                 'point': struct.unpack_from('<d', body, 1172)[0],
                 'spread': struct.unpack_from('<i', body, 1368)[0],
                 'calc_mode': struct.unpack_from('<i', body, 1404)[0],
-                'flags': struct.unpack_from('<q', body, 1360)[0],
+                'flags': struct.unpack_from('<Q', body, 1360)[0],
                 'raw': body,
             }
 
@@ -732,14 +813,20 @@ class MT5Client:
         """Handle live position update (cmd 10/22).
 
         cmd10 record (368 bytes):
-            @12:  ticket (i64)
+            @12:  ticket (u64)
             @84:  symbol (UTF-16LE 64B)
             @160: type (u32: 0=BUY, 1=SELL)
             @192: open_price (f64)
             @200: sl (f64)
             @208: tp (f64)
-            @216: volume (u32, lots*100M)
-            @266: comment (UTF-16LE, starts at @252 for #magic prefix)
+            @216: volume (u64, lots*100M)
+            @224: volume_current (u64, lots*100M)
+            @252: comment (UTF-16LE 64B, contains #magic prefix)
+            @336: time_create_ms (i32, always 0 in cmd10)
+            @340: time_update_ms (i32, always 0 in cmd10)
+
+        Profit is NOT in cmd10 — calculated from live quotes.
+        Magic is NOT in cmd10 field — parsed from comment.
 
         Multi-record bodies (736/760) use different layouts; for now
         we only parse the 368-byte single-record variant.
@@ -760,7 +847,7 @@ class MT5Client:
         off = 0
         while off + 368 <= len(body):
             rec = body[off:off + 368]
-            ticket = struct.unpack_from('<q', rec, 12)[0]
+            ticket = struct.unpack_from('<Q', rec, 12)[0]
             sym_raw = rec[84:212]
             try:
                 symbol = sym_raw.decode('utf-16-le', errors='ignore').split('\x00')[0]
@@ -773,7 +860,7 @@ class MT5Client:
                 continue
 
             pos_type = struct.unpack_from('<I', rec, 160)[0]
-            vol_raw = struct.unpack_from('<I', rec, 216)[0]
+            vol_raw = struct.unpack_from('<Q', rec, 216)[0]
 
             if pos_type > 1 or vol_raw > 10000000000 or vol_raw == 0:
                 off += 4
@@ -783,8 +870,23 @@ class MT5Client:
             off += 368
 
     def _parse_one_position_record(self, rec):
-        """Parse a single 368-byte cmd10 position record."""
-        ticket = struct.unpack_from('<q', rec, 12)[0]
+        """Parse a single 368-byte cmd10 position record.
+
+        Fields from cmd10 (368 bytes):
+            @12:  ticket (u64)
+            @84:  symbol (UTF-16LE 64B)
+            @160: type (u32: 0=BUY, 1=SELL)
+            @192: open_price (f64)
+            @200: sl (f64)
+            @208: tp (f64)
+            @216: volume (u64, lots*100M)
+            @252: comment (UTF-16LE 64B, contains #magic prefix)
+
+        NOT in cmd10: profit, magic, time, swap, commission.
+        Profit calculated from live quotes (matching web terminal).
+        Magic parsed from comment '#magic comment' format.
+        """
+        ticket = struct.unpack_from('<Q', rec, 12)[0]
         if ticket <= 0 or ticket > 9999999999:
             return
 
@@ -805,7 +907,7 @@ class MT5Client:
 
         sl = struct.unpack_from('<d', rec, 200)[0]
         tp = struct.unpack_from('<d', rec, 208)[0]
-        vol_raw = struct.unpack_from('<I', rec, 216)[0]
+        vol_raw = struct.unpack_from('<Q', rec, 216)[0]
         volume = vol_raw / LOT_MULTIPLIER
         if volume <= 0 or volume > 10000:
             return
@@ -820,10 +922,24 @@ class MT5Client:
         elif abs(old_pos.volume - volume) > 0.0001:
             event_type = 'volume'
 
+        current_price = 0.0
+        profit = 0.0
+        if price > 0 and volume > 0:
+            quote = self._quotes.get(symbol)
+            if quote:
+                if pos_type == 0:
+                    current_price = quote.bid
+                    profit = (quote.bid - price) * volume * 100000
+                else:
+                    current_price = quote.ask
+                    profit = (price - quote.ask) * volume * 100000
+
         self._position_cache[ticket] = Position(
             ticket=ticket, symbol=symbol, type=pos_type,
             volume=volume, price=price, sl=sl, tp=tp,
-            magic=magic, comment=comment,
+            profit=profit, magic=magic, comment=comment,
+            current_price=current_price,
+            time_open=old_pos.time_open if old_pos else datetime.now(timezone.utc),
         )
 
         if self._on_position_callback:
@@ -896,6 +1012,7 @@ class MT5Client:
             vals, off = parse_series(body, POS_SCHEMA, off)
             raw_comment = vals[18] or ""
             magic, comment = parse_magic_comment(raw_comment)
+            open_time = ts_to_dt(vals[2] if vals[2] else 0)
             result.append(Position(
                 ticket=vals[0],
                 symbol=vals[4] or "",
@@ -909,7 +1026,8 @@ class MT5Client:
                 commission=vals[14] or 0,
                 magic=magic,
                 comment=comment,
-                time=ts_to_dt(vals[2] if vals[2] else 0),
+                time=open_time,
+                time_open=open_time,
             ))
         return result
 
@@ -929,7 +1047,7 @@ class MT5Client:
             if off + self.ORDER_SIZE > len(body):
                 break
             rec = body[off:off + self.ORDER_SIZE]
-            ticket = struct.unpack_from('<q', rec, 0)[0]
+            ticket = struct.unpack_from('<Q', rec, 0)[0]
             sym_raw = rec[72:136]
             symbol = sym_raw.decode('utf-16-le', errors='ignore').split('\x00')[0]
             order_type = struct.unpack_from('<I', rec, 148)[0]
