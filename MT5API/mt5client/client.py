@@ -216,6 +216,7 @@ class MT5Client:
             @336: time_create_ms (i32)
 
         Profit recalculated from live quotes each cycle (matching web terminal).
+        Account profit/equity calculated from live position profits.
         """
         CMD4_RECORD_SIZE = 344
         CMD4_HEADER = 4
@@ -223,58 +224,86 @@ class MT5Client:
         while not self._cancelled.is_set():
             try:
                 await asyncio.sleep(2)
-                # Poll cmd4 for position list
-                resp = await self.send_and_wait(4, b'', 4, timeout=5)
-                if resp:
-                    body = resp['res_body']
-                    if len(body) >= CMD4_HEADER + CMD4_RECORD_SIZE:
-                        count = struct.unpack_from('<I', body, 0)[0]
-                        for i in range(count):
-                            off = CMD4_HEADER + i * CMD4_RECORD_SIZE
-                            if off + CMD4_RECORD_SIZE > len(body):
-                                break
-                            ticket = struct.unpack_from('<Q', body, off)[0]
-                            pos = self._position_cache.get(ticket)
-                            if pos:
-                                pos.sl = struct.unpack_from('<d', body, off + 108)[0]
-                                pos.tp = struct.unpack_from('<d', body, off + 116)[0]
-                                pos.swap = struct.unpack_from('<d', body, off + 164)[0]
-                                cmd4_magic = struct.unpack_from('<q', body, off + 172)[0]
-                                if cmd4_magic != 0:
-                                    pos.magic = cmd4_magic
-                                raw_comment = body[off+188:off+252].decode('utf-16-le', errors='ignore').split('\x00')[0]
-                                if raw_comment:
-                                    m, c = parse_magic_comment(raw_comment)
-                                    if m != 0:
-                                        pos.magic = m
-                                    if c:
-                                        pos.comment = c
-                                tcs = struct.unpack_from('<I', body, off + 16)[0]
-                                tms = struct.unpack_from('<i', body, off + 336)[0]
-                                if tcs > 0:
-                                    pos.time_open = ts_to_dt(tcs)
-                # Calculate live profit + current price from quotes for ALL positions
-                for ticket, pos in self._position_cache.items():
-                    if pos.volume > 0 and pos.price > 0:
-                        quote = self._quotes.get(pos.symbol)
-                        if quote:
-                            if pos.type == 0:
-                                pos.current_price = quote.bid
-                                pos.profit = (quote.bid - pos.price) * pos.volume * 100000
-                            else:
-                                pos.current_price = quote.ask
-                                pos.profit = (pos.price - quote.ask) * pos.volume * 100000
-                # Poll cmd3 for account balance
-                acct = await self.get_account()
-                if acct and self._on_account_callback:
-                    try:
-                        self._on_account_callback(acct)
-                    except Exception:
-                        pass
+                await self._do_poll_positions()
+                await self._do_poll_account()
             except asyncio.CancelledError:
                 break
             except Exception:
                 pass
+
+    async def _do_poll_positions(self):
+        """Poll cmd4 for position list, update cache, fire callbacks on changes."""
+        CMD4_RECORD_SIZE = 344
+        CMD4_HEADER = 4
+
+        resp = await self.send_and_wait(4, b'', 4, timeout=5)
+        if resp:
+            body = resp['res_body']
+            if len(body) >= CMD4_HEADER + CMD4_RECORD_SIZE:
+                count = struct.unpack_from('<I', body, 0)[0]
+                for i in range(count):
+                    off = CMD4_HEADER + i * CMD4_RECORD_SIZE
+                    if off + CMD4_RECORD_SIZE > len(body):
+                        break
+                    ticket = struct.unpack_from('<Q', body, off)[0]
+                    pos = self._position_cache.get(ticket)
+                    if pos:
+                        pos.sl = struct.unpack_from('<d', body, off + 108)[0]
+                        pos.tp = struct.unpack_from('<d', body, off + 116)[0]
+                        pos.swap = struct.unpack_from('<d', body, off + 164)[0]
+                        cmd4_magic = struct.unpack_from('<q', body, off + 172)[0]
+                        if cmd4_magic != 0:
+                            pos.magic = cmd4_magic
+                        raw_comment = body[off+188:off+252].decode('utf-16-le', errors='ignore').split('\x00')[0]
+                        if raw_comment:
+                            m, c = parse_magic_comment(raw_comment)
+                            if m != 0:
+                                pos.magic = m
+                            if c:
+                                pos.comment = c
+                        tcs = struct.unpack_from('<I', body, off + 16)[0]
+                        if tcs > 0:
+                            pos.time_open = ts_to_dt(tcs)
+        # Calculate live profit + current price from quotes for ALL positions
+        for ticket, pos in self._position_cache.items():
+            if pos.volume > 0 and pos.price > 0:
+                quote = self._quotes.get(pos.symbol)
+                if quote:
+                    old_profit = pos.profit
+                    if pos.type == 0:
+                        pos.current_price = quote.bid
+                        pos.profit = (quote.bid - pos.price) * pos.volume * 100000
+                    else:
+                        pos.current_price = quote.ask
+                        pos.profit = (pos.price - quote.ask) * pos.volume * 100000
+                    # Fire callback if profit changed significantly (> $0.01)
+                    if self._on_position_callback and abs(pos.profit - old_profit) > 0.01:
+                        try:
+                            self._on_position_callback('update', pos)
+                        except Exception:
+                            pass
+
+    async def _do_poll_account(self):
+        """Poll cmd3 for account info, calculate live profit/equity from positions."""
+        acct = await self.get_account()
+        if acct:
+            # Calculate live profit from position cache
+            live_profit = sum(p.profit for p in self._position_cache.values())
+            acct.profit = live_profit
+            acct.equity = acct.balance + live_profit
+            if self._on_account_callback:
+                try:
+                    self._on_account_callback(acct)
+                except Exception:
+                    pass
+
+    async def poll_positions(self):
+        """On-demand poll: immediately sync positions from server."""
+        await self._do_poll_positions()
+
+    async def poll_account(self):
+        """On-demand poll: immediately sync account from server."""
+        await self._do_poll_account()
 
     async def send_and_wait(self, cmd_id: int, payload: bytes = b'',
                             expected_cmd: int = None, timeout: float = 10) -> dict | None:
@@ -947,6 +976,10 @@ class MT5Client:
                 self._on_position_callback(event_type, self._position_cache[ticket])
             except Exception:
                 pass
+
+        # Trigger immediate cmd4 poll on new position for fresh SL/TP/magic/profit
+        if event_type == 'open':
+            asyncio.ensure_future(self._do_poll_positions())
 
     async def _handle_account_update(self, msg):
         """Handle live account update (cmd 14) — balance, equity, margin changes."""
