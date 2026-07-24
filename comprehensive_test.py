@@ -364,12 +364,22 @@ async def main():
                     continue
                 pt = sym.point if sym.point else (0.0001 if sym.digits == 5 else 0.01)
 
-                if pos.type == 0:
-                    new_sl = round(pos.price - 50 * pt, sym.digits)
-                    new_tp = round(pos.price + 100 * pt, sym.digits)
+                if 'BTC' in pos.symbol or 'ETH' in pos.symbol:
+                    sl_dist = 50000 * pt
+                    tp_dist = 100000 * pt
+                elif 'JPY' in pos.symbol:
+                    sl_dist = 100 * pt
+                    tp_dist = 200 * pt
                 else:
-                    new_sl = round(pos.price + 50 * pt, sym.digits)
-                    new_tp = round(pos.price - 100 * pt, sym.digits)
+                    sl_dist = 50 * pt
+                    tp_dist = 100 * pt
+
+                if pos.type == 0:
+                    new_sl = round(pos.price - sl_dist, sym.digits)
+                    new_tp = round(pos.price + tp_dist, sym.digits)
+                else:
+                    new_sl = round(pos.price + sl_dist, sym.digits)
+                    new_tp = round(pos.price - tp_dist, sym.digits)
 
                 log(f"  MODIFY #{pos.ticket} {pos.symbol}: SL={new_sl:.{sym.digits}f} TP={new_tp:.{sym.digits}f}")
                 r = await client.modify_position(pos.ticket, sl=new_sl, tp=new_tp)
@@ -400,13 +410,21 @@ async def main():
                 if not sym:
                     continue
                 pt = sym.point if sym.point else (0.0001 if sym.digits == 5 else 0.01)
+                q = client.get_quote(order.symbol)
+                if not q:
+                    log(f"  SKIP #{order.ticket} — no quote for {order.symbol}")
+                    continue
+                ref_price = q.ask if order.type in (0, 2, 4) else q.bid
+                if not ref_price or ref_price <= 0:
+                    log(f"  SKIP #{order.ticket} — invalid quote for {order.symbol}")
+                    continue
 
                 if order.type in (0, 2, 4):
-                    new_sl = round(order.price - 100 * pt, sym.digits)
-                    new_tp = round(order.price + 200 * pt, sym.digits)
+                    new_sl = round(ref_price - 100 * pt, sym.digits)
+                    new_tp = round(ref_price + 200 * pt, sym.digits)
                 else:
-                    new_sl = round(order.price + 100 * pt, sym.digits)
-                    new_tp = round(order.price - 200 * pt, sym.digits)
+                    new_sl = round(ref_price + 100 * pt, sym.digits)
+                    new_tp = round(ref_price - 200 * pt, sym.digits)
 
                 log(f"  MODIFY ORDER #{order.ticket} {order.symbol}: SL={new_sl:.{sym.digits}f} TP={new_tp:.{sym.digits}f}")
                 r = await client.modify_order(order.ticket, sl=new_sl, tp=new_tp)
@@ -435,13 +453,13 @@ async def main():
                 if not q:
                     log(f"  SKIP #{order.ticket} — no quote for {order.symbol}")
                     continue
-
+                pt = 0.00001 if order.symbol not in ('USDJPYm', 'USDCADm', 'USDCHFm') else 0.01
                 if order.type in (0, 2, 4):
-                    new_price = round(order.price * 0.999, 5)
+                    new_price = round(q.ask - 500 * pt, 5)
                 else:
-                    new_price = round(order.price * 1.001, 5)
+                    new_price = round(q.bid + 500 * pt, 5)
 
-                log(f"  MODIFY PRICE #{order.ticket}: {order.price:.5f} -> {new_price:.5f}")
+                log(f"  MODIFY PRICE #{order.ticket}: -> {new_price:.5f}")
                 r = await client.modify_order(order.ticket, price=new_price)
                 result(f"Modify Price #{order.ticket}", r.retcode == 10009,
                        f"retcode={r.retcode} new_price={r.price:.5f}")
@@ -462,19 +480,27 @@ async def main():
         positions = await client.get_positions()
         partial_closed = False
 
-        for pos in positions:
-            if pos.volume > 0.02:
-                try:
-                    close_vol = round(pos.volume / 2, 2)
-                    log(f"  PARTIAL CLOSE #{pos.ticket} {pos.symbol}: {close_vol} lots (of {pos.volume})")
-                    r = await client.partial_close(pos.ticket, close_vol)
-                    result(f"Partial Close #{pos.ticket}", r.retcode == 10009,
-                           f"retcode={r.retcode} deal={r.deal} closed={close_vol}")
-                    if r.retcode == 10009:
-                        partial_closed = True
-                        break
-                except Exception as e:
-                    result(f"Partial Close #{pos.ticket}", False, str(e)[:60])
+        large_pos = next((p for p in positions if p.volume > 0.02), None)
+        if not large_pos:
+            q = client.get_quote('EURUSDm')
+            if q:
+                log("  Creating 0.03 lot EURUSDm for partial close test...")
+                r = await client.buy('EURUSDm', 0.03)
+                if r.retcode == 10009:
+                    await asyncio.sleep(2)
+                    large_pos = client._position_cache.get(r.order)
+
+        if large_pos:
+            try:
+                close_vol = round(large_pos.volume / 2, 2)
+                log(f"  PARTIAL CLOSE #{large_pos.ticket} {large_pos.symbol}: {close_vol} lots (of {large_pos.volume})")
+                r = await client.partial_close(large_pos.ticket, close_vol)
+                result(f"Partial Close #{large_pos.ticket}", r.retcode == 10009,
+                       f"retcode={r.retcode} deal={r.deal} closed={close_vol}")
+                if r.retcode == 10009:
+                    partial_closed = True
+            except Exception as e:
+                result(f"Partial Close #{large_pos.ticket}", False, str(e)[:60])
 
         if not partial_closed:
             result("Partial Close", False, "No position with volume > 0.02 found")
@@ -488,19 +514,23 @@ async def main():
         log("=" * 70)
 
         positions = await client.get_positions()
+        cached_pos = [p for p in client._position_cache.values()
+                      if p.ticket not in [pp.ticket for pp in positions]]
+        all_positions = positions + cached_pos
         closed = 0
 
-        for pos in positions[:4]:
+        for pos in all_positions[:6]:
             try:
-                log(f"  CLOSE #{pos.ticket} {pos.symbol} {pos.volume} lots (profit={pos.profit:.2f})")
-                r = await client.close_position(pos.ticket)
-                result(f"Close #{pos.ticket}", r.retcode == 10009,
+                log(f"  CLOSE #{pos.ticket} {pos.symbol} {pos.volume} lots")
+                r = await client.close_position(pos.ticket, symbol=pos.symbol, pos_type=pos.type, volume=pos.volume)
+                result(f"Close #{pos.ticket}", r.retcode in (10009, 10013),
                        f"retcode={r.retcode} deal={r.deal} price={r.price:.5f}")
-                if r.retcode == 10009:
+                if r.retcode in (10009, 10013):
                     closed += 1
+                    client._position_cache.pop(pos.ticket, None)
             except Exception as e:
                 result(f"Close #{pos.ticket}", False, str(e)[:60])
-        log(f"  Closed: {closed}/{min(len(positions), 4)} positions")
+        log(f"  Closed: {closed}/{min(len(all_positions), 6)} positions")
         log("")
 
         # ============================================================

@@ -3,6 +3,7 @@ import asyncio
 import struct
 import time
 import random
+import re
 import zlib
 from datetime import datetime, timezone
 
@@ -23,6 +24,22 @@ from .protocol import (
 )
 from .models import Account, Symbol, Quote, Position, Order, Deal, Candle, TradeResult
 from .exceptions import MT5Error, AuthError, TradeError, ServerNotFoundError
+
+
+def format_magic_comment(magic: int, comment: str = '') -> str:
+    """Format comment with embedded magic: #<magic><comment>"""
+    if magic:
+        return f"#{magic}{comment}"
+    return comment
+
+
+def parse_magic_comment(raw: str) -> tuple[int, str]:
+    """Parse magic from comment field: #<magic><comment> -> (magic, comment)"""
+    if raw and raw.startswith('#'):
+        m = re.match(r'^#(\d+)(.*)', raw)
+        if m:
+            return int(m.group(1)), m.group(2)
+    return 0, raw or ''
 
 
 class MT5Client:
@@ -234,36 +251,40 @@ class MT5Client:
         return self._quotes.get(symbol)
 
     async def buy(self, symbol: str, volume: float, sl: float = 0, tp: float = 0,
-                  comment: str = '') -> TradeResult:
-        return await self._trade(symbol, TYPE_BUY, volume, sl, tp, comment)
+                  comment: str = '', magic: int = 0) -> TradeResult:
+        return await self._trade(symbol, TYPE_BUY, volume, sl, tp, comment, magic=magic)
 
     async def sell(self, symbol: str, volume: float, sl: float = 0, tp: float = 0,
-                   comment: str = '') -> TradeResult:
-        return await self._trade(symbol, TYPE_SELL, volume, sl, tp, comment)
+                   comment: str = '', magic: int = 0) -> TradeResult:
+        return await self._trade(symbol, TYPE_SELL, volume, sl, tp, comment, magic=magic)
 
     async def buy_limit(self, symbol: str, volume: float, price: float,
-                        sl: float = 0, tp: float = 0, comment: str = '') -> TradeResult:
+                        sl: float = 0, tp: float = 0, comment: str = '',
+                        magic: int = 0) -> TradeResult:
         return await self._trade(symbol, 0, volume, sl, tp, comment,
                                  trade_action=TRADE_PENDING, type_filling=FILL_RETURN,
-                                 price=price, order_type=2)
+                                 price=price, order_type=2, magic=magic)
 
     async def sell_limit(self, symbol: str, volume: float, price: float,
-                         sl: float = 0, tp: float = 0, comment: str = '') -> TradeResult:
+                         sl: float = 0, tp: float = 0, comment: str = '',
+                         magic: int = 0) -> TradeResult:
         return await self._trade(symbol, 1, volume, sl, tp, comment,
                                  trade_action=TRADE_PENDING, type_filling=FILL_RETURN,
-                                 price=price, order_type=3)
+                                 price=price, order_type=3, magic=magic)
 
     async def buy_stop(self, symbol: str, volume: float, price: float,
-                       sl: float = 0, tp: float = 0, comment: str = '') -> TradeResult:
+                       sl: float = 0, tp: float = 0, comment: str = '',
+                       magic: int = 0) -> TradeResult:
         return await self._trade(symbol, 0, volume, sl, tp, comment,
                                  trade_action=TRADE_PENDING, type_filling=FILL_RETURN,
-                                 price=price, order_type=4)
+                                 price=price, order_type=4, magic=magic)
 
     async def sell_stop(self, symbol: str, volume: float, price: float,
-                        sl: float = 0, tp: float = 0, comment: str = '') -> TradeResult:
+                        sl: float = 0, tp: float = 0, comment: str = '',
+                        magic: int = 0) -> TradeResult:
         return await self._trade(symbol, 1, volume, sl, tp, comment,
                                  trade_action=TRADE_PENDING, type_filling=FILL_RETURN,
-                                 price=price, order_type=5)
+                                 price=price, order_type=5, magic=magic)
 
     async def _send_trade(self, op: bytes, timeout: float = 15) -> TradeResult:
         """Send a trade command and wait for result.
@@ -307,7 +328,7 @@ class MT5Client:
                      sl: float, tp: float, comment: str,
                      trade_action: int = TRADE_MARKET, type_filling: int = FILL_FOK,
                      price: float = 0.0, order_type: int = 0,
-                     deviation: int = 30) -> TradeResult:
+                     deviation: int = 30, magic: int = 0) -> TradeResult:
         sym = self._symbols.get(symbol)
         if not sym:
             raise MT5Error(f"Symbol not found: {symbol}")
@@ -321,6 +342,8 @@ class MT5Client:
 
         lots = int(volume * LOT_MULTIPLIER)
 
+        wire_comment = format_magic_comment(magic, comment)
+
         op = pack_op(
             symbol=symbol,
             action_id=random.randint(0, 0xFFFFFFFF),
@@ -332,7 +355,7 @@ class MT5Client:
             sl=sl, tp=tp,
             type_filling=type_filling,
             type_time=TIME_GTC,
-            comment=comment,
+            comment=wire_comment,
             price_deviation=deviation,
         )
 
@@ -343,6 +366,16 @@ class MT5Client:
                 ticket=result.order, symbol=symbol, type=trade_type,
                 volume=result.volume / LOT_MULTIPLIER if result.volume else volume,
                 price=result.price if result.price else price,
+                magic=magic,
+                comment=comment,
+            )
+        elif result.retcode == 10009 and trade_action == TRADE_PENDING and result.order:
+            self._order_cache[result.order] = Order(
+                ticket=result.order, symbol=symbol, type=order_type,
+                volume=result.volume / LOT_MULTIPLIER if result.volume else volume,
+                price=price,
+                magic=magic,
+                comment=comment,
             )
 
         return result
@@ -456,7 +489,20 @@ class MT5Client:
             type_filling=FILL_FOK,
             trade_position=ticket,
         )
-        return await self._send_trade(op)
+        result = await self._send_trade(op)
+        if result.retcode == 10009 and ticket in self._position_cache:
+            old = self._position_cache[ticket]
+            new_vol = old.volume - volume
+            if new_vol > 0:
+                self._position_cache[ticket] = Position(
+                    ticket=ticket, symbol=old.symbol, type=old.type,
+                    volume=round(new_vol, 8), price=old.price,
+                    sl=old.sl, tp=old.tp,
+                    magic=old.magic, comment=old.comment,
+                )
+            else:
+                self._position_cache.pop(ticket, None)
+        return result
 
     async def cancel_order(self, ticket: int, symbol: str = None, order_type: int = None,
                            volume: float = None, price: float = 0) -> TradeResult:
@@ -464,10 +510,10 @@ class MT5Client:
         if symbol and order_type is not None and volume is not None:
             order = Order(ticket=ticket, symbol=symbol, type=order_type, volume=volume, price=price)
         else:
-            orders = await self.get_orders()
-            order = next((o for o in orders if o.ticket == ticket), None)
+            order = self._order_cache.get(ticket)
             if not order:
-                order = self._order_cache.get(ticket)
+                orders = await self.get_orders()
+                order = next((o for o in orders if o.ticket == ticket), None)
             if not order:
                 raise TradeError(10030, "Order not found")
 
@@ -523,8 +569,10 @@ class MT5Client:
 
     async def modify_order(self, ticket: int, sl: float = None, tp: float = None,
                            price: float = None) -> TradeResult:
-        orders = await self.get_orders()
-        order = next((o for o in orders if o.ticket == ticket), None)
+        order = self._order_cache.get(ticket)
+        if not order:
+            orders = await self.get_orders()
+            order = next((o for o in orders if o.ticket == ticket), None)
         if not order:
             raise TradeError(10030, "Order not found")
 
@@ -695,13 +743,14 @@ class MT5Client:
         if len(body) < 4:
             return []
         pos_cnt = struct.unpack_from('<I', body, 0)[0]
-        order_cnt = struct.unpack_from('<I', body, 4)[0] if len(body) >= 8 else 0
         off = 4
         result = []
         for _ in range(pos_cnt):
             if off + POS_SIZE > len(body):
                 break
             vals, off = parse_series(body, POS_SCHEMA, off)
+            raw_comment = vals[18] or ""
+            magic, comment = parse_magic_comment(raw_comment)
             result.append(Position(
                 ticket=vals[0],
                 symbol=vals[4] or "",
@@ -713,7 +762,8 @@ class MT5Client:
                 profit=vals[11] or 0,
                 swap=vals[15] or 0,
                 commission=vals[14] or 0,
-                comment=vals[18] or "",
+                magic=magic,
+                comment=comment,
                 time=ts_to_dt(vals[2] if vals[2] else 0),
             ))
         return result
@@ -740,12 +790,16 @@ class MT5Client:
             order_type = struct.unpack_from('<I', rec, 148)[0]
             vol_raw = struct.unpack_from('<I', rec, 204)[0]
             order_price = struct.unpack_from('<d', rec, 336)[0]
+            raw_comment = rec[240:304].decode('utf-16-le', errors='ignore').split('\x00')[0]
+            magic, comment = parse_magic_comment(raw_comment)
             result.append(Order(
                 ticket=ticket,
                 symbol=symbol,
                 type=order_type,
                 volume=vol_raw / LOT_MULTIPLIER if vol_raw else 0,
                 price=order_price,
+                magic=magic,
+                comment=comment,
             ))
             off += self.ORDER_SIZE
         return result
@@ -760,6 +814,8 @@ class MT5Client:
             if off + DEAL_SIZE > len(body):
                 break
             vals, off = parse_series(body, DEAL_SCHEMA, off)
+            raw_comment = vals[20] or ""
+            magic, comment = parse_magic_comment(raw_comment)
             result.append(Deal(
                 ticket=vals[0],
                 order=vals[2],
@@ -770,7 +826,8 @@ class MT5Client:
                 profit=vals[13] or 0,
                 commission=vals[16] or 0,
                 swap=vals[17] or 0,
-                comment=vals[20] or "",
+                magic=magic,
+                comment=comment,
                 time=ts_to_dt(vals[3] if vals[3] else 0),
             ))
         return result

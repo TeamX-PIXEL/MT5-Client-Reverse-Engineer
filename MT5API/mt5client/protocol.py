@@ -289,6 +289,7 @@ def pack_op(
     trade_position: int = 0,
     price_trigger: float = 0.0,
     price_deviation: int = 0,
+    magic: int = 0,
 ) -> bytes:
     op = bytearray(OP_SIZE)
     struct.pack_into('<I', op, 0, action_id)

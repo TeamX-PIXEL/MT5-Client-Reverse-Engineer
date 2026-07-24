@@ -61,6 +61,7 @@ class Position:
     profit: float = 0.0
     swap: float = 0.0
     commission: float = 0.0
+    magic: int = 0
     comment: str = ""
     time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -75,6 +76,7 @@ class Order:
     price: float = 0.0
     sl: float = 0.0
     tp: float = 0.0
+    magic: int = 0
     comment: str = ""
     time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -91,6 +93,7 @@ class Deal:
     profit: float = 0.0
     commission: float = 0.0
     swap: float = 0.0
+    magic: int = 0
     comment: str = ""
     time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
