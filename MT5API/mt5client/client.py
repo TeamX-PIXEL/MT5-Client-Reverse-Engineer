@@ -27,16 +27,16 @@ from .exceptions import MT5Error, AuthError, TradeError, ServerNotFoundError
 
 
 def format_magic_comment(magic: int, comment: str = '') -> str:
-    """Format comment with embedded magic: #<magic><comment>"""
+    """Format comment with embedded magic: #<magic> <comment>"""
     if magic:
-        return f"#{magic}{comment}"
+        return f"#{magic} {comment}" if comment else f"#{magic}"
     return comment
 
 
 def parse_magic_comment(raw: str) -> tuple[int, str]:
-    """Parse magic from comment field: #<magic><comment> -> (magic, comment)"""
+    """Parse magic from comment field: #<magic> <comment> -> (magic, comment)"""
     if raw and raw.startswith('#'):
-        m = re.match(r'^#(\d+)(.*)', raw)
+        m = re.match(r'^#(\d+)\s?(.*)', raw)
         if m:
             return int(m.group(1)), m.group(2)
     return 0, raw or ''
@@ -65,9 +65,12 @@ class MT5Client:
         self._on_quote_callback = None
         self._on_trade_callback = None
         self._on_spec_callback = None
+        self._on_position_callback = None
+        self._on_account_callback = None
         self._spec_data: dict[int, bytes] = {}  # symbol_id -> spec bytes
         self._position_cache: dict[int, Position] = {}  # ticket -> Position (from TRADE_EVENT)
         self._order_cache: dict[int, Order] = {}  # ticket -> Order (from pending trade results)
+        self._debug_recv = False  # Set True to log all incoming commands
 
     async def __aenter__(self):
         # 1. Resolve server IP
@@ -151,6 +154,11 @@ class MT5Client:
 
                 cmd = msg['cmd_id']
 
+                # Debug: log all non-quote/non-heartbeat commands
+                if cmd not in (8, 51) and self._debug_recv:
+                    body_len = len(msg.get('res_body', b''))
+                    print(f'[DEBUG] cmd={cmd} body_len={body_len}')
+
                 if cmd in self._pending:
                     future = self._pending.pop(cmd)
                     if not future.done():
@@ -163,7 +171,11 @@ class MT5Client:
                     await self._handle_trade_event(msg)
                 elif cmd == 17:
                     await self._handle_spec(msg)
-                elif cmd in (22, 14, 15, 51):
+                elif cmd in (10, 22):
+                    await self._handle_position_update(msg)
+                elif cmd == 14:
+                    await self._handle_account_update(msg)
+                elif cmd in (15, 51):
                     pass
             except asyncio.TimeoutError:
                 pass
@@ -606,6 +618,19 @@ class MT5Client:
     def on_spec(self, callback):
         self._on_spec_callback = callback
 
+    def on_position(self, callback):
+        """Register callback for live position updates (cmd 22).
+        Callback receives: (event_type: str, position: Position)
+        event_type: 'open', 'update', 'close', 'volume'
+        """
+        self._on_position_callback = callback
+
+    def on_account(self, callback):
+        """Register callback for live account updates (cmd 14).
+        Callback receives: (account: Account)
+        """
+        self._on_account_callback = callback
+
     # --- Internal handlers ---
 
     async def _handle_quote(self, msg):
@@ -702,6 +727,126 @@ class MT5Client:
                     self._on_spec_callback(spec)
                 except Exception:
                     pass
+
+    async def _handle_position_update(self, msg):
+        """Handle live position update (cmd 10/22).
+
+        cmd10 record (368 bytes):
+            @12:  ticket (i64)
+            @84:  symbol (UTF-16LE 64B)
+            @160: type (u32: 0=BUY, 1=SELL)
+            @192: open_price (f64)
+            @200: sl (f64)
+            @208: tp (f64)
+            @216: volume (u32, lots*100M)
+            @266: comment (UTF-16LE, starts at @252 for #magic prefix)
+
+        Multi-record bodies (736/760) use different layouts; for now
+        we only parse the 368-byte single-record variant.
+        """
+        body = msg['res_body']
+        if len(body) < 368:
+            return
+
+        # 368-byte single position record
+        if len(body) == 368:
+            self._parse_one_position_record(body)
+            return
+
+        # Multi-record: try to find 368-byte records embedded in larger body
+        # cmd10 multi-record bodies start with a 4-byte count header,
+        # then contain position records of varying sizes.
+        # Scan for valid symbols to find record boundaries.
+        off = 0
+        while off + 368 <= len(body):
+            rec = body[off:off + 368]
+            ticket = struct.unpack_from('<q', rec, 12)[0]
+            sym_raw = rec[84:212]
+            try:
+                symbol = sym_raw.decode('utf-16-le', errors='ignore').split('\x00')[0]
+            except Exception:
+                off += 4
+                continue
+
+            if not symbol or len(symbol) > 20 or not symbol[0].isalpha():
+                off += 4
+                continue
+
+            pos_type = struct.unpack_from('<I', rec, 160)[0]
+            vol_raw = struct.unpack_from('<I', rec, 216)[0]
+
+            if pos_type > 1 or vol_raw > 10000000000 or vol_raw == 0:
+                off += 4
+                continue
+
+            self._parse_one_position_record(rec)
+            off += 368
+
+    def _parse_one_position_record(self, rec):
+        """Parse a single 368-byte cmd10 position record."""
+        ticket = struct.unpack_from('<q', rec, 12)[0]
+        if ticket <= 0 or ticket > 9999999999:
+            return
+
+        sym_raw = rec[84:212]
+        symbol = sym_raw.decode('utf-16-le', errors='ignore').split('\x00')[0]
+        if not symbol or len(symbol) > 20 or not symbol[0].isalpha():
+            return
+        if not all(c.isascii() and c.isalnum() or c in ('.', '_', '-') for c in symbol):
+            return
+
+        pos_type = struct.unpack_from('<I', rec, 160)[0]
+        if pos_type > 1:
+            return
+
+        price = struct.unpack_from('<d', rec, 192)[0]
+        if price < 0 or price > 100000:
+            return
+
+        sl = struct.unpack_from('<d', rec, 200)[0]
+        tp = struct.unpack_from('<d', rec, 208)[0]
+        vol_raw = struct.unpack_from('<I', rec, 216)[0]
+        volume = vol_raw / LOT_MULTIPLIER
+        if volume <= 0 or volume > 10000:
+            return
+
+        raw_comment = rec[252:316].decode('utf-16-le', errors='ignore').split('\x00')[0]
+        magic, comment = parse_magic_comment(raw_comment)
+
+        old_pos = self._position_cache.get(ticket)
+        event_type = 'update'
+        if old_pos is None:
+            event_type = 'open'
+        elif abs(old_pos.volume - volume) > 0.0001:
+            event_type = 'volume'
+
+        self._position_cache[ticket] = Position(
+            ticket=ticket, symbol=symbol, type=pos_type,
+            volume=volume, price=price, sl=sl, tp=tp,
+            magic=magic, comment=comment,
+        )
+
+        if self._on_position_callback:
+            try:
+                self._on_position_callback(event_type, self._position_cache[ticket])
+            except Exception:
+                pass
+
+    async def _handle_account_update(self, msg):
+        """Handle live account update (cmd 14) — balance, equity, margin changes."""
+        body = msg['res_body']
+        if len(body) < 4:
+            return
+        try:
+            acct = self._parse_account(body)
+            self._account = acct
+            if self._on_account_callback:
+                try:
+                    self._on_account_callback(acct)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # --- Parsers ---
 

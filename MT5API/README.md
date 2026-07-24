@@ -199,6 +199,9 @@ result = await client.buy("EURUSDm", 0.01, sl=1.08, tp=1.10, comment="my order")
 
 # SELL
 result = await client.sell("EURUSDm", 0.01)
+
+# BUY with magic number
+result = await client.buy("EURUSDm", 0.01, magic=77777, comment="ea_trade")
 ```
 
 **Parameters:**
@@ -209,6 +212,7 @@ result = await client.sell("EURUSDm", 0.01)
 | `sl` | `float` | `0` | Stop-loss price (0 = none) |
 | `tp` | `float` | `0` | Take-profit price (0 = none) |
 | `comment` | `str` | `""` | Order comment |
+| `magic` | `int` | `0` | Magic number (embedded in comment as `#<magic> <comment>`) |
 
 **Returns `TradeResult`:**
 | Field | Type | Description |
@@ -248,11 +252,61 @@ result = await client.sell_stop("EURUSDm", 0.01, price=1.07)
 | `sl` | `float` | `0` | Stop-loss (0 = none) |
 | `tp` | `float` | `0` | Take-profit (0 = none) |
 | `comment` | `str` | `""` | Order comment |
+| `magic` | `int` | `0` | Magic number (embedded in comment) |
 
 **Notes:**
 - Pending price must be at least 100 × point away from current market price
 - Uses `type_filling=2` (RETURN), not FOK/IOC
 - Returns same `TradeResult` as market orders
+
+---
+
+### Magic Number
+
+The MT5 WebSocket API does **not** support magic numbers in the wire protocol. This library works around it by embedding the magic in the `comment` field:
+
+```
+Format: #<magic> <comment>
+Example: #77777 ea_trade
+```
+
+**Setting magic when opening a trade:**
+```python
+result = await client.buy("EURUSDm", 0.01, magic=77777, comment="ea_trade")
+# Server stores comment as: "#77777 ea_trade"
+```
+
+**Reading magic from positions:**
+```python
+positions = await client.get_positions()
+for pos in positions:
+    print(f"ticket={pos.ticket} magic={pos.magic} comment={pos.comment}")
+    # ticket=2278740652 magic=77777 comment='ea_trade'
+```
+
+**Reading magic from orders:**
+```python
+orders = await client.get_orders()
+for order in orders:
+    print(f"ticket={order.ticket} magic={order.magic} comment={order.comment}")
+```
+
+**Reading magic from deals:**
+```python
+deals = await client.get_deals()
+for deal in deals:
+    print(f"ticket={deal.ticket} magic={deal.magic} comment={deal.comment}")
+```
+
+**How it works:**
+| Step | What happens |
+|------|-------------|
+| **Set** | `format_magic_comment(77777, "ea_trade")` → `"#77777 ea_trade"` |
+| **Send** | Embedded in the 64-byte comment field of the trade request |
+| **Parse** | `parse_magic_comment("#77777 ea_trade")` → `(77777, "ea_trade")` |
+| **Read** | Magic and comment are separate fields on Position/Order/Deal models |
+
+**Important:** This is a client-side workaround. The magic is stored in the comment field, not the native MT5 magic field. It cannot be used to filter trades in the MT5 terminal or by EAs.
 
 ---
 
