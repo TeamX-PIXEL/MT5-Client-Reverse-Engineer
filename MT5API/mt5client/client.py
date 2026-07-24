@@ -270,12 +270,14 @@ class MT5Client:
                 quote = self._quotes.get(pos.symbol)
                 if quote:
                     old_profit = pos.profit
+                    sym_obj = self._symbols.get(pos.symbol)
+                    contract_size = sym_obj.contract_size if sym_obj and sym_obj.contract_size != 100000.0 else self._guess_contract_size(pos.symbol)
                     if pos.type == 0:
                         pos.current_price = quote.bid
-                        pos.profit = (quote.bid - pos.price) * pos.volume * 100000
+                        pos.profit = (quote.bid - pos.price) * pos.volume * contract_size
                     else:
                         pos.current_price = quote.ask
-                        pos.profit = (pos.price - quote.ask) * pos.volume * 100000
+                        pos.profit = (pos.price - quote.ask) * pos.volume * contract_size
                     # Fire callback if profit changed significantly (> $0.01)
                     if self._on_position_callback and abs(pos.profit - old_profit) > 0.01:
                         try:
@@ -506,7 +508,12 @@ class MT5Client:
         resp = await self.send_and_wait(4, b'', 4)
         if not resp:
             return []
-        return self._parse_positions(resp['res_body'])
+        positions = self._parse_positions(resp['res_body'])
+        # Populate position cache for account profit calculation
+        for p in positions:
+            if p.ticket not in self._position_cache:
+                self._position_cache[p.ticket] = p
+        return positions
 
     async def get_orders(self) -> list[Order]:
         resp = await self.send_and_wait(4, b'', 4)
@@ -898,6 +905,16 @@ class MT5Client:
             self._parse_one_position_record(rec)
             off += 368
 
+    @staticmethod
+    def _guess_contract_size(symbol: str) -> float:
+        """Guess contract size from symbol name.
+        Metals (XAU/XAG/XPT/XPD) = 100, others = 100000.
+        """
+        base = symbol.upper().replace('m', '').replace('M', '')
+        if base.startswith(('XAU', 'XAG', 'XPT', 'XPD')):
+            return 100.0
+        return 100000.0
+
     def _parse_one_position_record(self, rec):
         """Parse a single 368-byte cmd10 position record.
 
@@ -953,15 +970,17 @@ class MT5Client:
 
         current_price = 0.0
         profit = 0.0
+        sym_obj = self._symbols.get(symbol)
+        contract_size = sym_obj.contract_size if sym_obj and sym_obj.contract_size != 100000.0 else self._guess_contract_size(symbol)
         if price > 0 and volume > 0:
             quote = self._quotes.get(symbol)
             if quote:
                 if pos_type == 0:
                     current_price = quote.bid
-                    profit = (quote.bid - price) * volume * 100000
+                    profit = (quote.bid - price) * volume * contract_size
                 else:
                     current_price = quote.ask
-                    profit = (price - quote.ask) * volume * 100000
+                    profit = (price - quote.ask) * volume * contract_size
 
         self._position_cache[ticket] = Position(
             ticket=ticket, symbol=symbol, type=pos_type,
@@ -1046,21 +1065,39 @@ class MT5Client:
             raw_comment = vals[18] or ""
             magic, comment = parse_magic_comment(raw_comment)
             open_time = ts_to_dt(vals[2] if vals[2] else 0)
+            sym_name = vals[4] or ""
+            pos_type = vals[5]
+            open_price = vals[6]
+            vol = vals[10] / LOT_MULTIPLIER if vals[10] else 0
+            # Calculate live profit from quotes
+            profit = 0.0
+            current_price = 0.0
+            if open_price > 0 and vol > 0:
+                quote = self._quotes.get(sym_name)
+                if quote:
+                    cs = self._guess_contract_size(sym_name)
+                    if pos_type == 0:
+                        current_price = quote.bid
+                        profit = (quote.bid - open_price) * vol * cs
+                    else:
+                        current_price = quote.ask
+                        profit = (open_price - quote.ask) * vol * cs
             result.append(Position(
                 ticket=vals[0],
-                symbol=vals[4] or "",
-                type=vals[5],
-                volume=vals[10] / LOT_MULTIPLIER if vals[10] else 0,
-                price=vals[6],
+                symbol=sym_name,
+                type=pos_type,
+                volume=vol,
+                price=open_price,
                 sl=vals[8],
                 tp=vals[9],
-                profit=vals[11] or 0,
+                profit=profit,
                 swap=vals[15] or 0,
                 commission=vals[14] or 0,
                 magic=magic,
                 comment=comment,
                 time=open_time,
                 time_open=open_time,
+                current_price=current_price,
             ))
         return result
 
